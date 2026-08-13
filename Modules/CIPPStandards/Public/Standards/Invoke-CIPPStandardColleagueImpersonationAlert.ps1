@@ -21,6 +21,8 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
         ADDEDCOMPONENT
             {"type":"heading","label":"Alert Banner (HTML)","required":false}
             {"type":"textField","name":"standards.ColleagueImpersonationAlert.disclaimerHtml","label":"Disclaimer HTML – Paste the full HTML for the warning banner","required":true}
+            {"type":"heading","label":"Display Name Matching","required":false}
+            {"type":"textField","name":"standards.ColleagueImpersonationAlert.displayNameSeparator","label":"Display name separator – Optional, for example |","required":false}
             {"type":"heading","label":"Keyword Exclusions (Exclude certain users by keywords)","required":false}
             {"type":"autoComplete","name":"standards.ColleagueImpersonationAlert.excludedMailboxes","label":"Exclude mailboxes by keywords for example any Displayname starting with (Leaver)","multiple":true,"creatable":true,"required":false}
             {"type":"heading","label":"Exempt Senders (Email Accounts)","required":false}
@@ -52,6 +54,7 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
     } #we're done.
 
     $ruleHtml = $Settings.disclaimerHtml
+    $displayNameSeparator = [string]$Settings.displayNameSeparator
 
     $excludeKeywords = @(
         @($Settings.excludedMailboxes) | ForEach-Object {
@@ -81,14 +84,17 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
     try {
         $mailboxes = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-Mailbox' `
             -cmdParams @{ ResultSize = 'Unlimited'; RecipientTypeDetails = @('UserMailbox', 'SharedMailbox') }
+
         $displayNames = @(
             $mailboxes | Where-Object {
                 $mb = $_
                 if ($mb.AccountDisabled -eq $true) { return $false }
+
                 foreach ($kw in $excludeKeywords) {
                     if (-not [string]::IsNullOrWhiteSpace($mb.DisplayName) -and
                         $mb.DisplayName -match [regex]::Escape($kw)) { return $false }
                 }
+
                 return -not [string]::IsNullOrWhiteSpace($mb.DisplayName)
             } | Select-Object -ExpandProperty DisplayName
         )
@@ -131,17 +137,42 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
 
     $BuildRuleStateList = {
         param($Rules)
+
         foreach ($entry in $groups.GetEnumerator()) {
             $range    = $entry.Key
             $pattern  = $entry.Value
             $ruleName = "($range) Colleague Impersonation Alert"
-            $names    = @($displayNames | Where-Object { $_ -match $pattern } | ForEach-Object { [regex]::Escape($_) })
+
+            $names = @(
+                $displayNames | Where-Object { $_ -match $pattern } | ForEach-Object {
+                    $fullName = $_.Trim()
+
+                    # Always protect the full DisplayName.
+                    [regex]::Escape($fullName)
+
+                    # Optionally also protect the part before the configured separator.
+                    if (-not [string]::IsNullOrWhiteSpace($displayNameSeparator)) {
+                        $separatorPattern = [regex]::Escape($displayNameSeparator.Trim())
+
+                        if ($fullName -match $separatorPattern) {
+                            $shortName = ($fullName -split "\s*$separatorPattern\s*", 2)[0].Trim()
+
+                            if (-not [string]::IsNullOrWhiteSpace($shortName) -and $shortName -ne $fullName) {
+                                [regex]::Escape($shortName)
+                            }
+                        }
+                    }
+                } | Sort-Object -Unique
+            )
+
             if ($names.Count -eq 0) { $names = @([regex]::Escape("($range)")) }
+
             $existing = $Rules | Where-Object { $_.Name -eq $ruleName } | Select-Object -First 1
 
             $namesMatch    = $false
             $expectedCount = $names.Count
             $actualCount   = 0
+
             if ($null -ne $existing) {
                 $existingPatterns = @($existing.HeaderMatchesPatterns | ForEach-Object { [string]$_ })
                 $actualCount      = $existingPatterns.Count
@@ -171,22 +202,34 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
 
             $seenSenders   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $exemptSenders = [System.Collections.Generic.List[string]]::new()
+
             foreach ($addr in $additionalExemptSenders) {
-                if (-not [string]::IsNullOrWhiteSpace($addr) -and $seenSenders.Add($addr.Trim())) { $exemptSenders.Add($addr.Trim()) }
+                if (-not [string]::IsNullOrWhiteSpace($addr) -and $seenSenders.Add($addr.Trim())) {
+                    $exemptSenders.Add($addr.Trim())
+                }
             }
+
             foreach ($addr in @($existingRule.ExceptIfFromAddressContainsWords)) {
                 $s = [string]$addr
-                if (-not [string]::IsNullOrWhiteSpace($s) -and $seenSenders.Add($s.Trim())) { $exemptSenders.Add($s.Trim()) }
+                if (-not [string]::IsNullOrWhiteSpace($s) -and $seenSenders.Add($s.Trim())) {
+                    $exemptSenders.Add($s.Trim())
+                }
             }
 
             $seenDomains   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             $exemptDomains = [System.Collections.Generic.List[string]]::new()
+
             foreach ($dom in $autoExemptDomains) {
-                if (-not [string]::IsNullOrWhiteSpace($dom) -and $seenDomains.Add($dom.Trim())) { $exemptDomains.Add($dom.Trim()) }
+                if (-not [string]::IsNullOrWhiteSpace($dom) -and $seenDomains.Add($dom.Trim())) {
+                    $exemptDomains.Add($dom.Trim())
+                }
             }
+
             foreach ($dom in @($existingRule.ExceptIfSenderDomainIs)) {
                 $s = [string]$dom
-                if (-not [string]::IsNullOrWhiteSpace($s) -and $seenDomains.Add($s.Trim())) { $exemptDomains.Add($s.Trim()) }
+                if (-not [string]::IsNullOrWhiteSpace($s) -and $seenDomains.Add($s.Trim())) {
+                    $exemptDomains.Add($s.Trim())
+                }
             }
 
             $cmdParams = @{
@@ -199,6 +242,7 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
                 HeaderMatchesPatterns             = $names
                 Comments                          = "CIPP managed rule ($range) - Letters $range"
             }
+
             if ($exemptSenders.Count -gt 0) {
                 $cmdParams['ExceptIfFromAddressContainsWords'] = @($exemptSenders)
             }
@@ -233,8 +277,8 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
         }
     }
 
-    $missingRules  = @($ruleStateList | Where-Object { $null -eq $_.ExistingRule })
-    $staleRules    = @($ruleStateList | Where-Object { $null -ne $_.ExistingRule -and -not $_.NamesMatch })
+    $missingRules   = @($ruleStateList | Where-Object { $null -eq $_.ExistingRule })
+    $staleRules     = @($ruleStateList | Where-Object { $null -ne $_.ExistingRule -and -not $_.NamesMatch })
     $StateIsCorrect = ($missingRules.Count -eq 0) -and ($staleRules.Count -eq 0)
 
     if ($Settings.alert -eq $true) {
@@ -246,6 +290,7 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
                 Write-StandardsAlert -message "ColleagueImpersonationAlert: missing transport rules: $missingNames" -object @{ MissingRules = $missingNames } -tenant $Tenant -standardName 'ColleagueImpersonationAlert' -standardId $Settings.standardId
                 Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "ColleagueImpersonationAlert: missing transport rules: $missingNames" -Sev Alert
             }
+
             if ($staleRules.Count -gt 0) {
                 $staleDetails = ($staleRules | ForEach-Object { "$($_.RuleName) (expected $($_.ExpectedCount), actual $($_.ActualCount))" }) -join ', '
                 Write-StandardsAlert -message "ColleagueImpersonationAlert: stale transport rules (user list out of date): $staleDetails" -object @{ StaleRules = $staleDetails } -tenant $Tenant -standardName 'ColleagueImpersonationAlert' -standardId $Settings.standardId
@@ -262,6 +307,7 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
             '(P-T) Colleague Impersonation Alert' = ($null -ne ($ruleStateList | Where-Object { $_.Range -eq 'P-T' } | Select-Object -First 1).ExistingRule) -and (($ruleStateList | Where-Object { $_.Range -eq 'P-T' } | Select-Object -First 1).NamesMatch)
             '(U-Z) Colleague Impersonation Alert' = ($null -ne ($ruleStateList | Where-Object { $_.Range -eq 'U-Z' } | Select-Object -First 1).ExistingRule) -and (($ruleStateList | Where-Object { $_.Range -eq 'U-Z' } | Select-Object -First 1).NamesMatch)
         }
+
         $ExpectedValue = [PSCustomObject]@{
             '(A-E) Colleague Impersonation Alert' = $true
             '(F-J) Colleague Impersonation Alert' = $true
@@ -269,6 +315,7 @@ function Invoke-CIPPStandardColleagueImpersonationAlert {
             '(P-T) Colleague Impersonation Alert' = $true
             '(U-Z) Colleague Impersonation Alert' = $true
         }
+
         Set-CIPPStandardsCompareField -FieldName 'standards.ColleagueImpersonationAlert' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
         Add-CIPPBPAField -FieldName 'ColleagueImpersonationAlert' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $Tenant
     }
